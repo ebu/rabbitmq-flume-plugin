@@ -7,19 +7,16 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
+import java.lang.Thread;
 
-import com.rabbitmq.client.*;
+import com.rabbitmq.client.AMQP;
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.Connection;
+import com.rabbitmq.client.ConnectionFactory;
+import com.rabbitmq.client.QueueingConsumer;
 
-import net.jodah.lyra.ConnectionOptions;
-import net.jodah.lyra.Connections;
-import net.jodah.lyra.config.Config;
-import net.jodah.lyra.config.RecoveryPolicies;
-import net.jodah.lyra.config.RecoveryPolicy;
-import net.jodah.lyra.config.RetryPolicy;
-import net.jodah.lyra.util.Duration;
 import org.apache.flume.CounterGroup;
 import org.apache.flume.Event;
-import org.apache.flume.FlumeException;
 import org.apache.flume.channel.ChannelProcessor;
 import org.apache.flume.event.EventBuilder;
 import org.apache.flume.instrumentation.SourceCounter;
@@ -35,6 +32,7 @@ public class Consumer implements Runnable {
     private static final String COUNTER_EXCEPTION = "rabbitmq.exception";
     private static final String COUNTER_REJECT = "rabbitmq.reject";
 
+    volatile boolean shutdown = false;
     private Connection connection;
     private Channel channel;
     private ChannelProcessor channelProcessor;
@@ -127,11 +125,12 @@ public class Consumer implements Runnable {
         return this;
     }
 
-    @Override
-    public void run() {
-        DefaultConsumer consumer;
+    private void run_unit() {
 
-        Config factory = new Config();
+        QueueingConsumer consumer;
+        QueueingConsumer.Delivery delivery;
+
+        ConnectionFactory factory = new ConnectionFactory();
 
         // Connect to RabbitMQ
         try {
@@ -161,30 +160,87 @@ public class Consumer implements Runnable {
         }
 
         // Create the new consumer and set the consumer tag
-        consumer = new DefaultConsumer(channel) {
-            @Override  public void handleDelivery(String consumerTag,
-                                                  Envelope envelope,
-                                                  AMQP.BasicProperties properties,
-                                                  byte[] body) throws IOException {
-                sourceCounter.incrementEventReceivedCount();
-                try {
-                    channelProcessor.processEvent(parseMessage(envelope, properties, body));
-                    sourceCounter.incrementEventAcceptedCount();
-                    ackMessage(envelope.getDeliveryTag());
-                } catch (Exception ex) {
-                    logger.error("Error writing to channel for {}, message rejected {}", this, ex);
-                    rejectMessage(envelope.getDeliveryTag());
-                }
-            }
-        };
+        consumer = new QueueingConsumer(channel);
 
         try {
-            channel.basicConsume(queue, autoAck, "flumeConsumer", consumer);
+            channel.basicConsume(queue, autoAck, consumer);
         } catch (IOException ex) {
             logger.error("Error starting consumer: {}", ex);
             counterGroup.incrementAndGet(COUNTER_EXCEPTION);
             this.close();
+            return;
         }
+
+        // Loop until shutdown is called
+        while (!shutdown) {
+            // Get the next message from the stack
+            try {
+                // Handle timeout
+                if (timeout < 0) {
+                    delivery = consumer.nextDelivery();
+                } else {
+                    delivery = consumer.nextDelivery(timeout); // returns null on timeout
+                }
+            } catch (InterruptedException ex) {
+                logger.error("Consumer interrupted for {}, exiting: {}", this, ex);
+                break;
+            }
+            // Process the delivery if any
+            if (delivery != null) {
+                sourceCounter.incrementEventReceivedCount();
+
+                try {
+                    channelProcessor.processEvent(parseMessage(delivery));
+                } catch (Exception ex) {
+                    logger.error("Error writing to channel for {}, message rejected {}", this, ex);
+                    rejectMessage(getDeliveryTag(delivery));
+                    continue;
+                }
+                sourceCounter.incrementEventAcceptedCount();
+                if (!autoAck) ackMessage(getDeliveryTag(delivery));
+            }
+
+            sourceCounter.incrementEventAcceptedCount();
+            /*
+            if (!autoAck) {
+                try {
+                    ackMessage(getDeliveryTag(delivery));
+                } catch (Exception ex) {
+                    logger.error("Error acking message for {}, message rejected {}", this, ex);
+                }
+            }*/
+        }
+
+        // Tell RabbitMQ that the consumer is stopping
+        cancelConsumer(consumer.getConsumerTag());
+
+        // Cancel consumer
+        this.close();
+    }
+
+    @Override
+    public void run() {
+        while (!shutdown) {
+
+            logger.info("Starting thread for {}", this);
+
+            try {
+                this.run_unit();
+            } catch (Exception ex) {
+                logger.error("Error with connection to RMQ for {}, will try again in 15s, {}", this, ex);
+            }
+
+            try {
+                Thread.sleep(15000);
+            } catch (Exception ex) {
+                return;
+            }
+
+        }
+    }
+
+    private long getDeliveryTag(QueueingConsumer.Delivery delivery) {
+        return delivery.getEnvelope().getDeliveryTag();
     }
 
     private void cancelConsumer(String consumerTag) {
@@ -216,19 +272,19 @@ public class Consumer implements Runnable {
         counterGroup.incrementAndGet(COUNTER_REJECT);
     }
 
-    private Event parseMessage(Envelope envelope, AMQP.BasicProperties props, byte[] body) {
+    private Event parseMessage(QueueingConsumer.Delivery delivery) {
         // Create the event passing in the body
-        Event event = EventBuilder.withBody(body);
+        Event event = EventBuilder.withBody(delivery.getBody());
 
         // Get the headers from properties, exchange, and routing-key
-        Map<String, String> headers = buildHeaders(props);
+        Map<String, String> headers = buildHeaders(delivery.getProperties());
 
-        String exchange = envelope.getExchange();
+        String exchange = delivery.getEnvelope().getExchange();
         if (exchange != null && !exchange.isEmpty()) {
             headers.put("exchange", exchange);
         }
 
-        String routingKey = envelope.getRoutingKey();
+        String routingKey = delivery.getEnvelope().getRoutingKey();
         if (routingKey != null && !routingKey.isEmpty()) {
             headers.put("routing-key", routingKey);
         }
@@ -318,10 +374,7 @@ public class Consumer implements Runnable {
     }
 
     public void shutdown() {
-        // Tell RabbitMQ that the consumer is stopping
-        cancelConsumer("flumeConsumer");
-        // Cancel consumer
-        this.close();
+        shutdown = true;
     }
 
     private void close() {
@@ -335,24 +388,17 @@ public class Consumer implements Runnable {
         }
     }
 
-    private Connection createRabbitMQConnection(Config config) throws IOException {
+    private Connection createRabbitMQConnection(ConnectionFactory factory) throws IOException {
         logger.debug("Connecting to RabbitMQ from {}", this);
-        config = config.withRecoveryPolicy(RecoveryPolicies.recoverAlways())
-                    .withRetryPolicy(new RetryPolicy()
-                            .withMaxAttempts(200)
-                            .withInterval(Duration.seconds(1))
-                            .withMaxDuration(Duration.minutes(5)));
-
-        ConnectionOptions options = new ConnectionOptions()
-                .withHost(hostname)
-                .withPort(port)
-                .withVirtualHost(virtualHost)
-                .withUsername(username)
-                .withPassword(password)
-                ;
+        factory.setAutomaticRecoveryEnabled(true);
+        factory.setHost(hostname);
+        factory.setPort(port);
+        factory.setVirtualHost(virtualHost);
+        factory.setUsername(username);
+        factory.setPassword(password);
         if (sslEnabled) {
             try {
-                options = options.withSsl();
+                factory.useSslProtocol();
             } catch (NoSuchAlgorithmException e) {
                 logger.error("Could not enable SSL: {}", e.toString());
             } catch (KeyManagementException e) {
@@ -360,10 +406,10 @@ public class Consumer implements Runnable {
             }
         }
         try {
-            return Connections.create(options, config);
-        } catch (java.util.concurrent.TimeoutException e) {
-            logger.error("Timeout connecting to RabbitMQ: {}", e.toString());
-            throw new IOException();
+            return factory.newConnection();
+        } catch (TimeoutException ex) {
+            logger.error("Error creating new fonnction: {}", ex.toString());
+            return null;
         }
     }
 
