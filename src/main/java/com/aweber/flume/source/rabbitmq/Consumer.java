@@ -8,6 +8,11 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
 import java.lang.Thread;
+import java.io.File;
+import java.io.FileInputStream;
+import java.security.KeyStore;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManagerFactory;
 
 import com.rabbitmq.client.AMQP;
 import com.rabbitmq.client.Channel;
@@ -388,6 +393,32 @@ public class Consumer implements Runnable {
         }
     }
 
+    private SSLContext buildSSLContext() {
+
+        try {
+            File f = new File("/etc/keystore");
+            if (!f.exists() || f.isDirectory()) {
+                return null;
+            }
+
+            char[] trustPassphrase = "keystore".toCharArray();
+            KeyStore tks = KeyStore.getInstance("JKS");
+            tks.load(new FileInputStream("/etc/keystore"), trustPassphrase);
+
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance("SunX509");
+            tmf.init(tks);
+
+            SSLContext c = SSLContext.getInstance("TLSv1.2");
+            c.init(null, tmf.getTrustManagers(), null);
+
+            return c;
+        } catch (Exception ex) {
+            logger.error("Error during creation of SSLContext: {}", ex.toString());
+        }
+
+        return null;
+    }
+
     private Connection createRabbitMQConnection(ConnectionFactory factory) throws IOException {
         logger.debug("Connecting to RabbitMQ from {}", this);
         factory.setAutomaticRecoveryEnabled(true);
@@ -397,8 +428,13 @@ public class Consumer implements Runnable {
         factory.setUsername(username);
         factory.setPassword(password);
         if (sslEnabled) {
+            SSLContext c = buildSSLContext();
             try {
-                factory.useSslProtocol();
+                if (c != null) {
+                    factory.useSslProtocol(c);
+                } else {
+                    factory.useSslProtocol();
+                }
             } catch (NoSuchAlgorithmException e) {
                 logger.error("Could not enable SSL: {}", e.toString());
             } catch (KeyManagementException e) {
