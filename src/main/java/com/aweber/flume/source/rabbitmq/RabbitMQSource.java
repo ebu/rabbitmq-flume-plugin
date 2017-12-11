@@ -18,6 +18,11 @@ import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
 import java.util.LinkedList;
 import java.util.List;
+import java.io.File;
+import java.io.FileInputStream;
+import java.security.KeyStore;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManagerFactory;
 
 
 public class RabbitMQSource extends AbstractSource implements Configurable, EventDrivenSource {
@@ -133,6 +138,32 @@ public class RabbitMQSource extends AbstractSource implements Configurable, Even
         super.stop();
     }
 
+    private SSLContext buildSSLContext() {
+
+        try {
+            File f = new File("/etc/keystore");
+            if (!f.exists() || f.isDirectory()) {
+                return null;
+            }
+
+            char[] trustPassphrase = "keystore".toCharArray();
+            KeyStore tks = KeyStore.getInstance("JKS");
+            tks.load(new FileInputStream("/etc/keystore"), trustPassphrase);
+
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance("SunX509");
+            tmf.init(tks);
+
+            SSLContext c = SSLContext.getInstance("TLSv1.2");
+            c.init(null, tmf.getTrustManagers(), null);
+
+            return c;
+        } catch (Exception ex) {
+            logger.error("Error during creation of SSLContext: {}", ex.toString());
+        }
+
+        return null;
+    }
+
     private void testRabbitMQConnection() {
         Connection connection;
 
@@ -142,8 +173,14 @@ public class RabbitMQSource extends AbstractSource implements Configurable, Even
         factory.setUsername(username);
         factory.setPassword(password);
         if (enableSSL) {
+
+            SSLContext c = buildSSLContext();
             try {
-                factory.useSslProtocol();
+                if (c != null) {
+                    factory.useSslProtocol(c);
+                } else {
+                    factory.useSslProtocol();
+                }
             } catch (NoSuchAlgorithmException ex) {
                 throw new IllegalArgumentException("Could not Enable SSL: " + ex.toString());
             } catch (KeyManagementException ex) {
